@@ -1,0 +1,776 @@
+---
+title: "Appropriations Dashboard"
+format:
+  dashboard:
+    theme: cosmo
+    orientation: rows
+execute:
+  echo: false
+  warning: false
+  message: false
+server: shiny
+---
+
+```{r}
+#| context: setup
+library(tidyverse)
+library(readr)
+library(janitor)
+library(scales)
+library(DT)
+library(shiny)
+library(plotly)
+library(bslib)   # Required for Value Boxes
+library(bsicons) # Required for Value Box Icons
+
+# --- 1. Load Earmarks Data ---
+files <- list.files(path = ".", pattern = "\\.csv$", full.names = TRUE)
+earmark_files <- files[!str_detect(str_to_lower(files), "member_metadata|member_roster")]
+
+earmarks_raw <- earmark_files %>%
+  set_names() %>%
+  map_dfr(
+    ~ read_csv(.x, col_types = cols(.default = col_character())),
+    .id = "file_path"
+  )
+
+# --- 2. Load & Clean Member Metadata (NORMALIZED MATCHING) ---
+member_meta <- tibble(
+  join_id = character(), # This will be our "Ugly" normalized ID (e.g. "HYDESMITH")
+  join_state = character(), 
+  party_code = character(), 
+  approps_code = character()
+)
+
+if (file.exists("member_metadata.csv")) {
+  raw_meta <- read_csv("member_metadata.csv", col_types = cols(.default = col_character())) %>%
+    clean_names()
+  
+  # Identify Name Column
+  name_col <- names(raw_meta)[str_detect(names(raw_meta), "name")][1]
+  
+  if (!is.na(name_col)) {
+    vec_name <- raw_meta[[name_col]]
+    
+    # Identify State Column
+    state_col <- names(raw_meta)[str_detect(names(raw_meta), "^state$")][1]
+    vec_state <- if (!is.na(state_col)) raw_meta[[state_col]] else rep(NA_character_, nrow(raw_meta))
+    
+    # Identify Party Column
+    party_col <- names(raw_meta)[str_detect(names(raw_meta), "party")][1]
+    vec_party <- if (!is.na(party_col)) raw_meta[[party_col]] else rep("Unknown", nrow(raw_meta))
+    
+    # Identify Approps Column
+    approps_col <- names(raw_meta)[str_detect(names(raw_meta), "approps|member")][1]
+    vec_approps <- if (!is.na(approps_col)) raw_meta[[approps_col]] else rep("No", nrow(raw_meta))
+    
+    member_meta <- tibble(
+      # --- NORMALIZE METADATA NAME ---
+      # 1. Trim whitespace
+      # 2. To Uppercase
+      # 3. Remove ALL non-letters (No hyphens, no spaces, no apostrophes)
+      join_id = str_to_upper(str_remove_all(vec_name, "[^a-zA-Z]")),
+      
+      join_state = if_else(is.na(vec_state), NA_character_, str_trim(vec_state)),
+      
+      party_code = case_when(
+        str_detect(vec_party, "Democrat") ~ "D",
+        str_detect(vec_party, "Republican") ~ "R",
+        TRUE ~ "Unknown"
+      ),
+      
+      approps_code = if_else(is.na(vec_approps) | vec_approps == "" | vec_approps == "No", "No", "Yes")
+    )
+  }
+}
+
+# --- 3. Clean & Join Data ---
+valid_geo <- c(
+  "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
+  "HI","ID","IL","IN","IA","KS","KY","LA","ME","MD",
+  "MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+  "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC",
+  "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY",
+  "DC","PR","GU","VI","MP","AS","USVI"
+)
+
+earmarks_base <- earmarks_raw %>%
+  clean_names() %>%
+  mutate(
+    amount = parse_number(amount),
+    file_name = basename(file_path),
+    chamber = case_when(
+      str_detect(str_to_lower(file_name), "^house") ~ "House",
+      str_detect(str_to_lower(file_name), "^senate") ~ "Senate",
+      TRUE ~ NA_character_
+    ),
+    committee = file_name %>%
+      str_remove("\\.csv$") %>%
+      str_remove("^(House|Senate)\\s*") %>%
+      str_remove("^FY\\d+\\s*") %>%
+      str_trim()
+  ) %>%
+  filter(
+    !(is.na(agency) & is.na(account) & is.na(recipient) & 
+      is.na(project) & is.na(amount))
+  ) %>%
+  mutate(
+    # --- INTELLIGENT STATE EXTRACTION ---
+    extracted_state = str_extract(requested_by, "\\(([A-Z]{2})\\)"),
+    extracted_state = str_remove_all(extracted_state, "[\\(\\)]"),
+    state_raw = coalesce(state, extracted_state),
+    state_clean = str_to_upper(str_trim(state_raw)),
+    state = if_else(state_clean %in% valid_geo, state_clean, NA_character_),
+    
+    project_name = coalesce(project_name, project),
+    recipient = coalesce(recipient, recipient),
+    requested_by = str_trim(requested_by),
+    
+    # --- CLEAN NAME FOR DISPLAY ---
+    # Remove "(WV)" for the pretty version we show humans
+    display_name = str_remove(requested_by, "\\s*\\(.*\\)"),
+    display_name = str_trim(display_name),
+    
+    # --- COMBINE SPONSORS ---
+    # If 'requested_by_2' exists and isn't empty, combine them: "Name1 & Name2"
+    all_requestors = if("requested_by_2" %in% names(.)) {
+           case_when(
+             !is.na(requested_by_2) & requested_by_2 != "" ~ paste(requested_by, "&", requested_by_2),
+             TRUE ~ requested_by
+           )
+        } else {
+           requested_by
+        },
+    
+    # --- NORMALIZE NAME FOR JOINING ---
+    # 1. Remove "(State)" part first
+    temp_name = str_remove(requested_by, "\\s*\\(.*\\)"),
+    # 2. Remove ", Firstname"
+    temp_name = str_remove(temp_name, ",.*$"),
+    # 3. APPLY SAME NORMALIZATION: Uppercase, keep only letters
+    join_id = str_to_upper(str_remove_all(temp_name, "[^a-zA-Z]"))
+  ) %>%
+  select(-any_of(c("party", "is_approps_member")))
+
+# Perform the Join using the Normalized ID
+has_state_meta <- !all(is.na(member_meta$join_state))
+
+if (has_state_meta) {
+  earmarks_clean <- earmarks_base %>%
+    left_join(member_meta, by = c("join_id", "state" = "join_state"))
+} else {
+  earmarks_clean <- earmarks_base %>%
+    left_join(member_meta, by = "join_id")
+}
+
+
+# Final Polish
+earmarks_clean <- earmarks_clean %>%
+  rename(
+    party = party_code,
+    is_approps_member = approps_code
+  ) %>%
+  mutate(
+    party = replace_na(party, "Unknown"),
+    is_approps_member = replace_na(is_approps_member, "No")
+  )
+
+# --- 4. Prepare Choices ---
+chamber_choices <- sort(unique(earmarks_clean$chamber))
+committee_choices <- sort(unique(earmarks_clean$committee))
+agency_choices <- sort(unique(earmarks_clean$agency))
+state_choices <- sort(unique(na.omit(earmarks_clean$state)))
+party_choices <- sort(unique(earmarks_clean$party))
+approps_choices <- c("All", "Yes", "No")
+sponsor_choices <- c(earmarks_clean$requested_by, earmarks_clean$requested_by_2) %>%
+  unique() %>%        # Remove duplicates
+  na.omit() %>%       # Remove NAs
+  sort()
+```
+
+# {.sidebar}
+
+### Filters
+
+```{r}
+#| title: "Sidebar Filters"
+
+selectInput("chamber_sel", "Chamber", choices = c("All", chamber_choices), selected = "All")
+selectInput("committee_sel", "Subcommittee", choices = c("All", committee_choices), selected = "All")
+selectInput("agency_sel", "Account", choices = c("All", agency_choices), selected = "All")
+selectInput("state_sel", "State/Territory", choices = c("All", state_choices), selected = "All")
+
+selectInput("party_sel", "Party", choices = c("All", party_choices), selected = "All")
+selectInput("approps_sel", "Approps Member?", choices = approps_choices, selected = "All")
+
+selectizeInput("selected_sponsor", "Search by Sponsor:", 
+               choices = sponsor_choices, # <--- Updates here
+               multiple = TRUE, 
+               options = list(placeholder = 'Type name (e.g. Smith)'))
+
+textInput("keyword_search", "Search Keywords", value = "", placeholder = "e.g. police, water")
+downloadButton("download_data", "Download Results")
+```
+
+---
+
+# Overview
+
+## Snapshot  {height="225px"}
+
+::: dashboard-row
+```{r}
+DT::dataTableOutput("tbl_overview")
+```
+:::
+
+## Search Results
+
+```{r}
+DT::dataTableOutput("tbl_projects")
+```
+
+# Party Breakdown
+
+## Party Breakdown
+
+:::: dashboard-row
+::: {.dashboard-column}
+```{r}
+#| title: "Overall Funding by Party"
+plotOutput("plot_party_pie")
+```
+:::
+::::
+
+## Bipartisanship
+
+:::: dashboard-row
+::: {.dashboard-column}
+```{r}
+#| title: "Overall Partisan Split by Committee"
+plotOutput("plot_committee_party")
+```
+:::
+::::
+
+# Subcommittees
+
+## Subcommittee Benchmarks
+
+::: dashboard-row
+```{r}
+DT::dataTableOutput("tbl_committees")
+```
+:::
+
+## Top subcommittees by total funding
+
+:::: dashboard-row
+::: {.dashboard-column}
+```{r}
+plotOutput("plot_committees", height = "1000px")
+```
+:::
+::::
+
+# Accounts
+
+## Agency and account benchmarks
+
+::: dashboard-row
+```{r}
+DT::dataTableOutput("tbl_accounts")
+```
+:::
+
+## Account funding ranges
+
+::: dashboard-row
+```{r}
+plotOutput("plot_accounts")
+```
+:::
+
+# Sponsors
+
+## Top Sponsors
+
+:::: dashboard-row
+::: {.dashboard-column}
+```{r}
+DT::dataTableOutput("tbl_sponsors")
+```
+:::
+::::
+
+## Top Sponsors by Funding
+
+:::: dashboard-row
+::: {.dashboard-column}
+```{r}
+#| title: "Member Funding Allocation by Federal Agency"
+plotOutput("plot_sponsor_agency", height = "500px")
+```
+:::
+::::
+
+# Geography
+
+## Funding by State or Territory
+
+:::: dashboard-row
+::: {.dashboard-column}
+```{r}
+#| title: "Total Funding by State"
+plotlyOutput("plot_map", height = "600px")
+```
+:::
+::::
+
+## Top States and Territories by Total Funding
+
+:::: dashboard-row
+::: {.dashboard-column}
+```{r}
+#| title: "Leaderboard: Top States"
+# A simple, sorted table to see who is #1
+DT::dataTableOutput("tbl_state_rankings")
+```
+:::
+::::
+
+```{r}
+#| context: server
+
+library(tidyverse)
+library(DT)
+library(scales)
+library(shiny)
+library(plotly)
+
+# 1. The Reactive Data Filter
+earmarks_f <- reactive({
+  req(input$chamber_sel) 
+  
+  df <- earmarks_clean
+  
+  # Filters
+  if (input$chamber_sel != "All") df <- df %>% filter(chamber == input$chamber_sel)
+  if (input$committee_sel != "All") df <- df %>% filter(committee == input$committee_sel)
+  if (input$agency_sel != "All") df <- df %>% filter(agency == input$agency_sel)
+  if (input$state_sel != "All") df <- df %>% filter(state == input$state_sel)
+  if (input$party_sel != "All") df <- df %>% filter(party == input$party_sel)
+  if (input$approps_sel != "All") df <- df %>% filter(is_approps_member == input$approps_sel)
+  
+  # Search
+  if (input$keyword_search != "") {
+    df <- df %>% filter(
+      str_detect(project_name, regex(input$keyword_search, ignore_case = TRUE)) | 
+      str_detect(recipient, regex(input$keyword_search, ignore_case = TRUE))
+    )
+  }
+  
+if (!is.null(input$selected_sponsor)) {
+    df <- df %>% filter(
+      requested_by %in% input$selected_sponsor | 
+      requested_by_2 %in% input$selected_sponsor
+    )
+    
+}
+  
+  df
+})
+
+# 2. Download
+output$download_data <- downloadHandler(
+  filename = function() {
+    paste("filtered_earmarks_", Sys.Date(), ".csv", sep = "")
+  },
+  content = function(file) {
+    write_csv(earmarks_f(), file)
+  }
+)
+
+# 3. Overview
+output$tbl_overview <- DT::renderDataTable({
+  earmarks_f() %>%
+    summarize(
+      "Total Projects" = n(),
+      "Total Funding" = sum(amount, na.rm = TRUE),
+      "Median Award" = median(amount, na.rm = TRUE),
+      "Mean Award" = mean(amount, na.rm = TRUE),
+      "Agencies" = n_distinct(agency),
+      "Accounts" = n_distinct(account),
+      "States" = n_distinct(state, na.rm = TRUE)
+    ) %>%
+    datatable(options = list(dom = "t", scrollX = TRUE), rownames = FALSE) %>%
+    formatCurrency(c("Total Funding", "Median Award", "Mean Award"))
+})
+
+output$val_funding <- renderText({
+  dollar(sum(earmarks_f()$amount, 
+             na.rm=TRUE), 
+         scale = 1e-9, 
+         suffix = "B")
+})
+
+output$val_projects <- renderText({
+  comma(nrow(earmarks_f()))
+})
+
+# 4. Search Results
+output$tbl_projects <- DT::renderDataTable({
+  earmarks_f() %>%
+    select(
+      "Project" = project_name,
+      "Recipient" = recipient,
+      "Amount" = amount,
+      "Agency" = agency,
+      "Account" = account,
+      "State" = state,
+      "Requestor(s)" = all_requestors,
+      "Party" = party,
+      "Approps?" = is_approps_member
+    ) %>%
+    distinct() %>%
+    arrange(desc(Amount)) %>%
+    datatable(
+      options = list(pageLength = 10, scrollY = "500px", scrollX = TRUE, dom = "ltip"),
+      rownames = FALSE
+    ) %>%
+    formatCurrency("Amount")
+})
+
+# 5. Party Pie
+output$plot_party_pie <- renderPlot({
+  party_data <- earmarks_f() %>%
+    group_by(party) %>%
+    summarize(total = sum(amount, na.rm = TRUE)) %>%
+    mutate(
+      # Calculate percentage
+      pct = total / sum(total),
+      # Create a clean label (e.g. "45%")
+      label = scales::percent(pct, accuracy = 1),
+      pct = total / sum(total)
+    )
+  
+  ggplot(party_data, aes(x = "", y = total, fill = party)) +
+    geom_col(width = 1) +
+    coord_polar("y", start = 0) +
+    # Add the percentage labels
+    geom_text(aes(label = label), position = position_stack(vjust = 0.5), color = "white", size = 5, fontface = "bold") +
+    # Ensure these match your data values ("D" vs "Democrat")
+    scale_fill_manual(values = c("D" = "#3366CC", "R" = "#DC3912")) +
+    theme_void() +
+    labs(fill = "Party")
+})
+
+# 6. Approps Advantage
+output$plot_approps_advantage <- renderPlot({
+  earmarks_f() %>%
+    filter(amount > 0) %>%
+    ggplot(aes(x = is_approps_member, y = amount, fill = is_approps_member)) +
+    # Boxplot shows the median and range
+    geom_boxplot(outlier.alpha = 0.3) +
+    # Log scale is CRITICAL because some projects are $10k and some are $100M
+    scale_y_log10(labels = scales::dollar_format()) +
+    scale_fill_manual(values = c("Yes" = "#2ca02c", "No" = "#7f7f7f", "Unknown" = "#d3d3d3")) +
+    theme_minimal() +
+    labs(
+      title = "Distribution of Project Sizes",
+      subtitle = "Do committee members get larger individual checks? (Log Scale)",
+      y = "Project Amount (Log Scale)",
+      x = "Appropriations Member?"
+    ) +
+    theme(legend.position = "none")
+})
+
+# 7. Committee Party Split
+output$plot_committee_party <- renderPlot({
+  earmarks_f() %>%
+    group_by(committee, party) %>%
+    summarize(total = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+    group_by(committee) %>%
+    mutate(
+      percent = total / sum(total),
+       label_text = scales::percent(percent, accuracy = 1)
+    ) %>%
+    ungroup() %>%
+    ggplot(aes(x = percent, y = reorder(committee, percent), fill = party)) +
+    geom_col() +
+    geom_text(
+      aes(label = if_else(percent > 0.05, label_text, "")),
+      position = position_stack(vjust = 0.5),
+      color = "white",
+      size = 3.5,
+      fontface = "bold"
+    ) +
+    scale_x_continuous(labels = scales::percent) +
+    scale_fill_manual(values = c("D" = "#3366CC", "R" = "#DC3912", "Unknown" = "#999999")) +
+    theme_minimal() +
+    labs(x = "% of Funding by Chamber", y = NULL, title = NULL, fill = "Party")
+})
+
+# 8. Committees Table
+output$tbl_committees <- DT::renderDataTable({
+  earmarks_f() %>%
+    group_by(chamber, committee) %>%
+    summarize(
+      Projects = n(),
+      "Total Funding" = sum(amount, na.rm = TRUE),
+      "Median Award" = median(amount, na.rm = TRUE),
+      "25th Percentile" = quantile(amount, 0.25, na.rm = TRUE),
+      "75th Percentile" = quantile(amount, 0.75, na.rm = TRUE)
+    ) %>%
+    arrange(desc(`Total Funding`)) %>%
+    rename(Chamber = chamber, Committee = committee) %>%
+    datatable(options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE) %>%
+    formatCurrency(c("Total Funding", "Median Award", "25th Percentile", "75th Percentile"))
+})
+
+# 9. Committees Plot (New Lollipop Style)
+output$plot_committees <- renderPlot({
+  # 1. Prepare Data
+  plot_data <- earmarks_f() %>%
+    group_by(chamber, committee) %>%
+    summarize(total = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      # Create clean labels
+      clean_name = paste(replace_na(chamber, "Unknown"), committee, sep = " - "),
+      label_text = scales::dollar(total, scale = 1e-6, suffix = "M") # e.g. "$50M"
+    ) %>%
+    slice_max(total, n = 12)
+  
+  # 2. Draw Plot
+  ggplot(plot_data, aes(x = total, y = reorder(clean_name, total))) +
+    # Draw the "stick" (keep this grey so it doesn't distract)
+    geom_segment(aes(x = 0, xend = total, y = reorder(clean_name, total), yend = reorder(clean_name, total)), color = "grey80", linewidth = 1) +
+    
+    # Draw the "pop" (circle) - THIS is where we add color based on Chamber
+    geom_point(aes(color = chamber), size = 5) +
+    
+    # Add text label (keep text dark grey for readability)
+    geom_text(aes(label = label_text), hjust = -0.3, size = 3.5, fontface = "bold", color = "#333333") +
+    
+    # Formatting
+    scale_x_continuous(labels = scales::dollar, expand = expansion(mult = c(0, 0.2))) +
+    
+    # Define your colors here
+    scale_color_manual(values = c("House" = "#4e79a7", "Senate" = "#a0cbe8", "Unknown" = "grey50")) +
+    
+    labs(
+      title = "Funding Amounts by Committee",
+      x = "Total Funding (in millions)",
+      y = NULL,
+      color = "Chamber"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.y = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom" # Moves the House/Senate key to the bottom
+    )
+})
+
+# 10. Accounts Table
+output$tbl_accounts <- DT::renderDataTable({
+  earmarks_f() %>%
+    filter(!is.na(amount)) %>%
+    group_by(agency, account) %>%
+    summarize(
+      Projects = n(),
+      "Total Funding" = sum(amount, na.rm = TRUE),
+      "Median Award" = median(amount, na.rm = TRUE),
+      "25th Pctl" = quantile(amount, 0.25, na.rm = TRUE),
+      "75th Pctl" = quantile(amount, 0.75, na.rm = TRUE),
+      "90th Pctl" = quantile(amount, 0.90, na.rm = TRUE)
+    ) %>%
+    arrange(desc(`Total Funding`)) %>%
+    rename(Agency = agency, Account = account) %>%
+    datatable(options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE) %>%
+    formatCurrency(c("Total Funding", "Median Award", "25th Pctl", "75th Pctl", "90th Pctl"))
+})
+
+# 11. Accounts Plot (The "Sweet Spot" Boxplot)
+output$plot_accounts <- renderPlot({
+  # 1. Identify Top 5 Accounts
+  top_accounts_list <- earmarks_f() %>%
+    group_by(agency, account) %>%
+    summarize(total = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+    slice_max(total, n = 5) %>%
+    pull(account)
+
+  # 2. Filter Data
+  plot_data <- earmarks_f() %>%
+    filter(account %in% top_accounts_list) %>%
+    filter(amount > 0)
+    
+  # 3. Calculate Medians for Labels
+  median_labels <- plot_data %>%
+    group_by(account) %>%
+    summarize(median_val = median(amount, na.rm = TRUE)) %>%
+    mutate(label = scales::dollar(median_val, scale = 1e-5, suffix = "M", accuracy = 0.1))
+
+  # 4. Draw Plot
+  ggplot(plot_data, aes(x = amount, y = reorder(account, amount, FUN = median))) +
+    # The box shows the range
+    geom_boxplot(fill = "#a0cbe8", outlier.alpha = 0.2, outlier.size = 1) +
+    
+    # Add the Median Text Label directly on the chart
+    geom_text(
+      data = median_labels, 
+      aes(x = median_val, y = account, label = label),
+      vjust = -2.5, # Pushes the text slightly above the box
+      fontface = "bold",
+      size = 3.5
+    ) +
+    
+    scale_x_log10(labels = scales::dollar_format(accuracy = 1)) +
+    labs(
+      title = "Project Size Ranges (with Median Values)",
+      subtitle = "The box represents the middle 50% of awards. The label is the median award.",
+      x = "Project Amount",
+      y = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.y = element_text(size = 11, face = "bold"), # Make account names larger
+      panel.grid.minor = element_blank()
+    )
+})
+
+# 11. Sponsors Helper
+sponsors_long <- reactive({
+  earmarks_f() %>%
+    pivot_longer(cols = c(requested_by, requested_by_2), names_to = "slot", values_to = "sponsor") %>%
+    mutate(sponsor = na_if(str_squish(sponsor), "")) %>%
+    filter(!is.na(sponsor))
+})
+
+# 12. Sponsors Table
+output$tbl_sponsors <- DT::renderDataTable({
+  sponsors_long() %>%
+    group_by(chamber, sponsor) %>%
+    summarize(
+      Projects = n(),
+      "Total Funding" = sum(amount, na.rm = TRUE),
+      "Median Award" = median(amount, na.rm = TRUE)
+    ) %>%
+    arrange(desc(`Total Funding`)) %>%
+    rename(Chamber = chamber, Sponsor = sponsor) %>%
+    datatable(options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE) %>%
+    formatCurrency(c("Total Funding", "Median Award"))
+})
+
+# 13. Sponsor Page - Funding by Agency Plot
+output$plot_sponsor_agency <- renderPlot({
+  # 1. Check for data
+  validate(need(nrow(earmarks_f()) > 0, "No data available."))
+
+  # 2. Prepare Data
+  plot_data <- earmarks_f() %>%
+    group_by(agency) %>%
+    summarize(total = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+    # Top 8 Agencies is usually enough to see the trend
+    slice_max(total, n = 8)
+
+  # 3. Draw Plot
+  ggplot(plot_data, aes(x = reorder(str_wrap(agency, 30), total), y = total)) +
+    geom_col(fill = "#a0cbe8") + # Use the Lighter Blue to distinguish from the Recipients chart
+    
+    # Add labels
+    geom_text(
+      aes(label = scales::dollar(total, scale = 1e-6, suffix = "M")), 
+      hjust = -0.1, 
+      fontface = "bold", 
+      size = 4
+    ) +
+    
+    coord_flip() +
+    
+    scale_y_continuous(labels = scales::dollar, expand = expansion(mult = c(0, 0.2))) +
+    labs(,
+      x = NULL,
+      y = "Total Amount"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 16),
+      axis.text.y = element_text(size = 11),
+      panel.grid.major.y = element_blank()
+    )
+})
+
+# 14. Geography Plot (Interactive Plotly Map)
+output$plot_map <- renderPlotly({
+  # 1. Prepare Data
+  map_data <- earmarks_f() %>%
+    group_by(state) %>%
+    summarize(total = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+    # Create hover text
+    mutate(
+      hover_text = paste(
+        "State:", state, "<br>",
+        "Funding:", scales::dollar(total)
+      )
+    )
+
+  # 2. Draw Map using plot_geo (Native Plotly)
+  plot_geo(map_data, locationmode = 'USA-states') %>%
+    add_trace(
+      z = ~total,              # Color by total funding
+      locations = ~state,      # Use the 2-letter state code (e.g. "TX")
+      text = ~hover_text,      # What shows up when you hover
+      hoverinfo = "text",      # Only show our custom text
+      colors = "Blues"         # Color scale (Blues, Reds, Viridis, etc.)
+    ) %>%
+    colorbar(title = "Total Funding") %>%
+    layout(
+      title = list(text = "<b>Total Funding by State</b>", y = 0.98),
+      geo = list(
+        scope = 'usa',         # Limit map to USA
+        projection = list(type = 'albers usa'), # The standard curvature for US maps
+        showlakes = TRUE,      # Draw lakes
+        lakecolor = toRGB('white')
+      )
+    )
+})
+
+# 16. Geography - State Leaderboard Table (Updated)
+output$tbl_state_rankings <- DT::renderDataTable({
+  # 1. Prepare Data
+  state_ranks <- earmarks_f() %>%
+    group_by(state) %>%
+    summarize(
+      Count = n(),
+      Total = sum(amount, na.rm = TRUE),
+      # Logic: If ANY row for this state has approps == "Yes", mark the state as "Yes"
+      Has_Approps = if(any(is_approps_member == "Yes", na.rm = TRUE)) "Yes" else "No"
+    ) %>%
+    arrange(desc(Total)) %>%
+    # Rename columns to be Capitalized and Clear
+    rename(
+      "State" = state,
+      "Project Count" = Count,
+      "Total Funding" = Total,
+      "Approps Member?" = Has_Approps
+    )
+  
+  # 2. Render Table
+  DT::datatable(
+    state_ranks,
+    rownames = FALSE,
+    options = list(
+      pageLength = 12,
+      dom = 't',        # Only show the table (no search bar)
+      scrollY = "500px", 
+      paging = FALSE,
+      # Center align the State, Count, and Yes/No columns for a cleaner look
+      columnDefs = list(list(className = 'dt-center', targets = c(0, 1, 3))) 
+    )
+  ) %>%
+  DT::formatCurrency("Total Funding", digits = 0) # Format dollars
+})
+```
