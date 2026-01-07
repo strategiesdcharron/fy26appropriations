@@ -610,7 +610,7 @@ output$plot_accounts <- renderPlot({
   median_labels <- plot_data %>%
     group_by(account) %>%
     summarize(median_val = median(amount, na.rm = TRUE)) %>%
-    mutate(label = scales::dollar(median_val, scale = 1e-5, suffix = "M", accuracy = 0.1))
+    mutate(label = scales::dollar(median_val, scale = 1e-6, suffix = "M", accuracy = 0.1))
 
   # 4. Draw Plot
   ggplot(plot_data, aes(x = amount, y = reorder(account, amount, FUN = median))) +
