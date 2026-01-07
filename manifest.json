@@ -1,7 +1,7 @@
 {
   "version": 1,
   "locale": "en_US",
-  "platform": "2025.09.2+418",
+  "platform": "4.5.1",
   "metadata": {
     "appmode": "quarto-shiny",
     "primary_rmd": "fy26_earmarks_report.qmd",
