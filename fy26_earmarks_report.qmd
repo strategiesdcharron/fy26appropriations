@@ -20,8 +20,10 @@ library(scales)
 library(DT)
 library(shiny)
 library(plotly)
-library(bslib)   # Required for Value Boxes
-library(bsicons) # Required for Value Box Icons
+library(bslib)
+library(bsicons)
+library(dplyr)
+library(stringr)
 
 # --- 1. Load Earmarks Data ---
 files <- list.files(path = ".", pattern = "\\.csv$", full.names = TRUE)
@@ -163,7 +165,16 @@ if (has_state_meta) {
     left_join(member_meta, by = "join_id")
 }
 
-
+earmarks_clean <- earmarks_clean %>%
+  mutate(
+    clean_recipient = str_to_upper(recipient),
+    recipient_category = case_when(
+      clean_recipient %in% valid_geo ~ "Government/Municipality",
+      grepl("CITY|COUNTY|TOWN|VILLAGE|BOROUGH|MUNICIPAL|DEPT|DEPARTMENT|POLICE|FIRE|SHERIFF|PUBLIC SCHOOL|DISTRICT|STATE|AUTHORITY|COMMISSION|GOVERNMENT|ARMY|RECLAMATION|TRIBE|USDA|NATION|PARISH|MARYLAND TRANSIT|GOVERNOR|GENERAL SERVICES ADMINISTRATION|PORT OF", clean_recipient) ~ "Government/Municipality",
+      grepl("UNIVERSITY|COLLEGE|FOUNDATION|SOCIETY|ASSOCIATION|ALLIANCE|INSTITUTE|CENTER|COUNCIL|HOSPITAL|HEALTH|CLINIC|MUSEUM|CHARITY|INC|CORP|LIMITED|NONPROFIT|TRUST|ACADEMY|CLUB|YMCA|YWCA|SCHOOLS|GOODWILL|BIG BROTHER|UNITED WAY|LAND BANK", clean_recipient) ~ "Nonprofit/Other",
+      TRUE ~ "Unclassified")
+  )
+      
 # Final Polish
 earmarks_clean <- earmarks_clean %>%
   rename(
@@ -186,6 +197,7 @@ sponsor_choices <- c(earmarks_clean$requested_by, earmarks_clean$requested_by_2)
   unique() %>%        # Remove duplicates
   na.omit() %>%       # Remove NAs
   sort()
+recipient_choices <- c("All", sort(unique(earmarks_clean$recipient_category)))
 ```
 
 # {.sidebar}
@@ -199,7 +211,8 @@ selectInput("chamber_sel", "Chamber", choices = c("All", chamber_choices), selec
 selectInput("committee_sel", "Subcommittee", choices = c("All", committee_choices), selected = "All")
 selectInput("agency_sel", "Account", choices = c("All", agency_choices), selected = "All")
 selectInput("state_sel", "State/Territory", choices = c("All", state_choices), selected = "All")
-
+selectInput("recipient_sel", "Recipient Type", 
+            choices = c("All", "Government/Municipality", "Nonprofit/Other", "Unclassified"))
 selectInput("party_sel", "Party", choices = c("All", party_choices), selected = "All")
 selectInput("approps_sel", "Approps Member?", choices = approps_choices, selected = "All")
 
@@ -362,6 +375,8 @@ earmarks_f <- reactive({
   if (input$state_sel != "All") df <- df %>% filter(state == input$state_sel)
   if (input$party_sel != "All") df <- df %>% filter(party == input$party_sel)
   if (input$approps_sel != "All") df <- df %>% filter(is_approps_member == input$approps_sel)
+  if (input$recipient_sel != "All")
+      df <- df %>% filter(recipient_category == input$recipient_sel)
   
   # Search
   if (input$keyword_search != "") {
